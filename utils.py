@@ -1,3 +1,6 @@
+import torch
+
+
 class EarlyStopping:
     def __init__(self, mode='min', patience=3, tolerance=0):
         self.stop_count = 0
@@ -24,3 +27,32 @@ class EarlyStopping:
         self.stopped = False
         self.stop_count = 0
         self.best_value = float('inf') if self.mode == 'min' else float('-inf')
+
+
+class GamblersLoss:
+    def __init__(self, temperature):
+        """
+        :param temperature: >1, <= number of classes
+        """
+        self.temperature = temperature
+
+    def __call__(self, out, target):
+        probs = torch.softmax(out, dim=-1)
+        outputs, reservation = probs[:, :-1], probs[:, -1]
+        gain = torch.gather(outputs, dim=1, index=target.unsqueeze(1)).squeeze()
+        doubling_rate = (gain + (reservation / self.temperature)).log()
+        # doubling_rate *= target
+        return -doubling_rate.mean()
+
+
+def get_confidences(method, out):
+    if method == 'none':
+        confidences = torch.softmax(out, dim=-1)
+        confidences = confidences.max(dim=-1)[0]
+    elif method == 'gamblers':
+        confidences = torch.softmax(out[:, :-1], dim=-1)
+        confidences = confidences[:, -1]
+    else:
+        raise ValueError("Wrong method name.")
+
+    return confidences
