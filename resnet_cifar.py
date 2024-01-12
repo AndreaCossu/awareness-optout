@@ -18,8 +18,7 @@ parser.add_argument('--epochs', type=int, default=60)
 parser.add_argument('--lr', type=float, default=1e-3)
 parser.add_argument('--weight_decay', type=float, default=5e-4)
 
-parser.add_argument('--patience', type=int, default=6)
-parser.add_argument('--tolerance', type=float, default=0.05)
+parser.add_argument('--patience', type=int, default=0)
 
 parser.add_argument('--eval_confidence_threshold', type=float, nargs='+',
                     default=[0.90,0.80,0.70,0.60,0.50,0.40,0.30,0.20,0.10, 0.0],
@@ -101,7 +100,8 @@ else:
     raise ValueError("Wrong method name.")
 pretrain_criterion = torch.nn.CrossEntropyLoss()
 
-stopping = EarlyStopping(mode='min', patience=args.patience, tolerance=args.tolerance)
+if args.patience > 0:
+    stopping = EarlyStopping(mode='max', patience=args.patience)
 
 for epoch in range(args.epochs):
     train_loss, train_acc = 0., 0.
@@ -135,8 +135,8 @@ for epoch in range(args.epochs):
                        f"valid{conf}/loss": valid_loss,
                        f"valid{conf}/num_predictions": num_predictions,
                        f"valid{conf}/perc_predictions": 100 * (num_predictions / float(len(valid_dataset)))}, commit=False)
-            if conf == 0.0:
-                stopping.update(valid_loss)
+            if conf == 0.0 and args.patience > 0:
+                stopping.update(valid_acc)
 
         coverages = evaluate_coverage(confidences, predictions, args.coverage)
         coverages_table = wandb.Table(data=[[x, y] for x, y in coverages.items()], columns=["coverage", "acc"])
@@ -147,7 +147,7 @@ for epoch in range(args.epochs):
 
     wandb.log({"epoch": epoch})
 
-    if stopping.stopped:
+    if args.patience > 0 and stopping.stopped:
         print("Stopping training after epoch ", epoch+1)
         break
 
