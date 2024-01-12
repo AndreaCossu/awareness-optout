@@ -1,30 +1,32 @@
-from torchvision.models import resnet18, vgg16_bn
-from torchvision.datasets import CIFAR10
-from torchvision.transforms import ToTensor, Compose, Normalize
+from torchvision.datasets import CIFAR100
+from torchvision.models import resnet101
+from torchvision.transforms import ToTensor, Compose, Normalize, RandomCrop, RandomHorizontalFlip
 import torch
 import argparse
 import wandb
-from utils import EarlyStopping, GamblersLoss, get_confidences, compute_confidences
+from utils import (EarlyStopping, GamblersLoss, compute_dataset_confidences_predictions, evaluate_coverage,
+                   evaluate_with_threshold, evaluate_calibration)
 from tqdm import tqdm
 
-
-normalization = Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
 
 # generate code to transform the parameters above in input argument with argparse library
 parser = argparse.ArgumentParser()
 parser.add_argument('--train_batch_size', type=int, default=64)
 parser.add_argument('--eval_batch_size', type=int, default=128)
-parser.add_argument('--train_metrics_every', type=int, default=100)
-parser.add_argument('--epochs', type=int, default=30)
+parser.add_argument('--metrics_epoch_frequency', type=int, default=1)
+parser.add_argument('--epochs', type=int, default=60)
 parser.add_argument('--lr', type=float, default=1e-3)
+parser.add_argument('--weight_decay', type=float, default=5e-4)
 
-parser.add_argument('--patience', type=int, default=3)
-parser.add_argument('--tolerance', type=float, default=0.0)
+parser.add_argument('--patience', type=int, default=6)
+parser.add_argument('--tolerance', type=float, default=0.05)
 
-parser.add_argument('--eval_confidence_threshold', type=float, default=0.1,
+parser.add_argument('--eval_confidence_threshold', type=float, nargs='+',
+                    default=[0.90,0.80,0.70,0.60,0.50,0.40,0.30,0.20,0.10, 0.0],
                     help='use during evaluation to filter out examples where the model is not confident enough')
 
-parser.add_argument('--coverage', type=float, nargs='+',default=[100.,99.,98.,97.,95.,90.,85.,80.,75.,70.,60.,50.,40.,30.,20.,10.],
+parser.add_argument('--coverage', type=float, nargs='+',
+                    default=[100.,99.,98.,97.,95.,90.,85.,80.,75.,70.,60.,50.,40.,30.,20.,10.],
                     help='the expected coverages used to evaluated the accuracies after abstention')
 
 parser.add_argument('--pretrain_epochs', type=int, default=0)
@@ -40,95 +42,38 @@ args = parser.parse_args()
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-run_name = f"{args.method}_eval{args.eval_confidence_threshold}"
-
-
-@torch.no_grad()
-def evaluate_with_threshold(mdl, method, loader, confidence_threshold=0.0):
-    """
-    Evaluate the model on examples where the model is at least confident as the threshold.
-    If the model is not sufficiently confident on any example, a perfect loss and accuracy will be returned.
-    :param mdl:
-    :param loader:
-    :param confidence_threshold: if 0.0, always evaluate.
-    :return: accuracy, loss, number of predictions that surpassed confidence threshold
-    """
-
-    mdl.eval()
-    correct = 0
-    total = 0
-    loss_sum = 0.
-
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)
-        out = mdl(x)
-
-        confidences = get_confidences(args.method, out)
-        mask = confidences >= confidence_threshold
-        num_predictions = mask.sum().item()
-        if num_predictions == 0:
-            continue
-
-        if method == 'gamblers':
-            out = out[:, :-1]
-
-        loss = torch.nn.functional.cross_entropy(out[mask], y[mask]).item()
-        correct += (out[mask].argmax(dim=-1) == y[mask]).sum().item()
-        total += num_predictions
-        loss_sum += loss
-
-    if total == 0:
-        return 1.0, 0.0, total
-    else:
-        acc = 100 * (correct / float(total))
-        loss = loss_sum / float(total)
-        return acc, loss, total
-
-
-@torch.no_grad()
-def evaluate_coverage(mdl, method, loader, coverages):
-    mdl.eval()
-
-    confidence_accs = []
-
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)
-        out = mdl(x)
-
-        confidences = get_confidences(args.method, out).cpu().numpy().tolist()
-
-        if method == 'gamblers':
-            out = out[:, :-1]
-
-        correct = (out.argmax(dim=-1) == y).long().cpu().numpy().tolist()
-        for conf, corr in zip(confidences, correct):
-            confidence_accs.append((conf, corr))
-
-    sorted_accs = sorted(confidence_accs, key=lambda el: el[0], reverse=True)
-
-    coverages_accs = {}
-    for c in coverages:
-        num_elements = int(float(c/100) * len(sorted_accs))
-        coveraged = sorted_accs[:num_elements]
-        coverages_accs[c] = 100*(sum([el[1] for el in coveraged]) / num_elements)
-
-    return coverages_accs
-
+run_name = f"{args.method}"
+if args.method == 'gamblers':
+    run_name += f"_temp{args.gamblers_temperature}"
 
 wandb.init(
     project="awareness",
     config=vars(args),
-    name=run_name,
-    # dir=save_dir,
+    name='cifar100_'+run_name,
+    tags=['resnet101']
 )
 
-num_classes = 10
+num_classes = 100
 
-model = resnet18(weights=None, num_classes=num_classes+int(args.method == 'gamblers')).to(device)
-train_dataset = CIFAR10(root='/raid/a.cossu/datasets', train=True, download=True,
-                        transform=Compose([ToTensor(), normalization]))
-test_dataset = CIFAR10(root='/raid/a.cossu/datasets', train=False, download=True,
-                       transform=Compose([ToTensor(), normalization]))
+model = resnet101(weights=None, num_classes=num_classes+int(args.method == 'gamblers')).to(device)
+
+
+transform_train = Compose([
+    RandomCrop(32, padding=4),
+    RandomHorizontalFlip(),
+    ToTensor(),
+    Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
+])
+
+transform_test = Compose([
+    ToTensor(),
+    Normalize( (0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
+])
+
+train_dataset = CIFAR100(root='/raid/a.cossu/datasets', train=True, download=True,
+                        transform=transform_train)
+test_dataset = CIFAR100(root='/raid/a.cossu/datasets', train=False, download=True,
+                       transform=transform_test)
 
 train_dataset, valid_dataset = torch.utils.data.random_split(train_dataset, [0.7, 0.3])
 
@@ -145,12 +90,7 @@ test_loader = torch.utils.data.DataLoader(test_dataset,
                                           shuffle=False,
                                           drop_last=False)
 
-if args.method == 'gamblers':
-    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
-else:
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-
-
+optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
 lr = args.lr
 
 if args.method == 'gamblers':
@@ -169,7 +109,6 @@ for epoch in range(args.epochs):
     for i, (x, y) in enumerate(tqdm(train_loader)):
         x, y = x.to(device), y.to(device)
         optimizer.zero_grad()
-        model.train()
         out = model(x)
 
         if args.pretrain_epochs > epoch:
@@ -180,58 +119,58 @@ for epoch in range(args.epochs):
         optimizer.step()
         train_loss += loss.item()
         train_acc += (out[:, :num_classes].argmax(dim=-1) == y).sum().item() / float(x.shape[0])
-        if (i+1) % args.train_metrics_every == 0:
-            train_acc /= float(args.train_metrics_every)
-            train_loss /= float(args.train_metrics_every)
-            wandb.log({"train/acc": train_acc, "train/loss": train_loss},
-                      commit=i+args.train_metrics_every < len(train_loader))
-            train_acc, train_loss = 0., 0.
 
-    if args.method == 'gamblers' and epoch in [25, 50, 75, 100, 125, 150, 175, 200, 225, 250, 275]:
-        lr *= 0.5
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+    train_acc /= float(len(train_loader))
+    train_loss /= float(len(train_loader))
+    wandb.log({"train/acc": train_acc, "train/loss": train_loss}, commit=False)
 
-    wandb.log({"epoch": epoch}, commit=False)
-
-    if args.pretrain_epochs <= epoch:
-        valid_acc, valid_loss, num_predictions = evaluate_with_threshold(model, args.method, valid_loader, confidence_threshold=args.eval_confidence_threshold)
-        wandb.log({f"valid{args.eval_confidence_threshold}/acc": valid_acc,
-                   f"valid{args.eval_confidence_threshold}/loss": valid_loss,
-                   f"valid{args.eval_confidence_threshold}/num_predictions": num_predictions,
-                   f"valid{args.eval_confidence_threshold}/perc_predictions": 100* (num_predictions / float(len(valid_dataset)))}, commit=False)
-
-        coverages = evaluate_coverage(model, args.method, valid_loader, args.coverage)
-        coverages_table = wandb.Table(data=[[x, y] for x, y in coverages.items()], columns=["coverage", "acc"])
-        wandb.log({f"valid_coverage/valid_coverage_{epoch}": wandb.plot.line(coverages_table, "coverage", "acc",
-                                                              title=f"Valid Coverage epoch {epoch}")}, commit=False)
-
-        confidences = compute_confidences(model, args.method, valid_loader, device)
-        table = wandb.Table(data=[[s] for s in confidences.tolist()], columns=["confidence"])
-        wandb.log({f"valid_confidence/confidence_{epoch}": wandb.plot.histogram(table, "confidence", title=f"Max valid confidence epoch {epoch}")},
+    if args.pretrain_epochs <= epoch and (epoch+1) % args.metrics_epoch_frequency == 0:
+        confidences, predictions, losses = compute_dataset_confidences_predictions(model, args.method, valid_loader, train_criterion, device)
+        table = wandb.Table(data=[[s] for s in confidences.cpu().numpy().tolist()], columns=["confidence"])
+        wandb.log({f"valid_confidence/confidence_{epoch}": wandb.plot.histogram(table, "confidence", title=f"Valid confidence epoch {epoch}")},
                   commit=False)
+        for conf in args.eval_confidence_threshold:
+            valid_acc, valid_loss, num_predictions = evaluate_with_threshold(confidences, predictions, losses, confidence_threshold=conf)
+            wandb.log({f"valid{conf}/acc": valid_acc,
+                       f"valid{conf}/loss": valid_loss,
+                       f"valid{conf}/num_predictions": num_predictions,
+                       f"valid{conf}/perc_predictions": 100 * (num_predictions / float(len(valid_dataset)))}, commit=False)
+            if conf == 0.0:
+                stopping.update(valid_loss)
 
+        coverages = evaluate_coverage(confidences, predictions, args.coverage)
+        coverages_table = wandb.Table(data=[[x, y] for x, y in coverages.items()], columns=["coverage", "acc"])
+        wandb.log({f"valid_coverage": wandb.plot.line(coverages_table, "coverage", "acc", title=f"Valid Coverage")}, commit=False)
 
-    valid_acc, valid_loss, _ = evaluate_with_threshold(model, args.method, valid_loader)
-    wandb.log({"valid_full/acc": valid_acc, "valid_full/loss": valid_loss})
+        calibration = evaluate_calibration(confidences, predictions, bins=args.eval_confidence_threshold)
+        wandb.log({"valid_calibration": calibration}, commit=False)
 
-    if stopping.update(valid_loss):
+    wandb.log({"epoch": epoch})
+
+    if stopping.stopped:
         print("Stopping training after epoch ", epoch+1)
         break
 
 if args.use_test:
-    test_acc, test_loss, _ = evaluate_with_threshold(model, args.method, test_loader)
-    wandb.log({"test_full/acc": test_acc, "test_full/loss": test_loss}, commit=False)
+    confidences, predictions, losses = compute_dataset_confidences_predictions(model, args.method, test_loader, train_criterion, device)
+    table = wandb.Table(data=[[s] for s in confidences.cpu().numpy().tolist()], columns=["confidence"])
+    wandb.log({f"test_confidence/confidence": wandb.plot.histogram(table, "confidence", title=f"Test confidence")}, commit=False)
 
-    coverages = evaluate_coverage(model, args.method, test_loader, args.coverage)
+    coverages = evaluate_coverage(confidences, predictions, args.coverage)
     coverages_table = wandb.Table(data=[[x, y] for x, y in coverages.items()], columns=["coverage", "acc"])
     wandb.log({f"test_coverage/test_coverage": wandb.plot.line(coverages, "coverage", "acc",
                                                                title=f"Test Coverage")}, commit=False)
 
-    test_acc, test_loss, num_predictions = evaluate_with_threshold(model, args.method, test_loader, confidence_threshold=args.eval_confidence_threshold)
-    wandb.log({f"test_{args.eval_confidence_threshold}/acc": test_acc,
-               f"test_{args.eval_confidence_threshold}/loss": test_loss,
-               f"test_{args.eval_confidence_threshold}/num_predictions": num_predictions,
-               f"test_{args.eval_confidence_threshold}/perc_predictions": 100 * (num_predictions / float(len(valid_dataset)))})
+    for conf in args.eval_confidence_threshold:
+        test_acc, test_loss, num_predictions = evaluate_with_threshold(confidences, predictions, losses, confidence_threshold=conf)
+        wandb.log({f"test_{conf}/acc": test_acc,
+                   f"test{conf}/loss": valid_loss,
+                   f"test_{conf}/num_predictions": num_predictions,
+                   f"test_{conf}/perc_predictions": 100 * (num_predictions / float(len(valid_dataset)))},
+                  commit=False)
+
+    calibration = evaluate_calibration(confidences, predictions, bins=args.eval_confidence_threshold)
+    wandb.log({"test_calibration": calibration})
+
 
 wandb.finish()
