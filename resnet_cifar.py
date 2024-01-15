@@ -158,7 +158,7 @@ if args.use_test:
 
     coverages = evaluate_coverage(confidences, predictions, args.coverage)
     coverages_table = wandb.Table(data=[[x, y] for x, y in coverages.items()], columns=["coverage", "acc"])
-    wandb.log({f"test_coverage/test_coverage": wandb.plot.line(coverages, "coverage", "acc",
+    wandb.log({f"test_coverage/test_coverage": wandb.plot.line(coverages_table, "coverage", "acc",
                                                                title=f"Test Coverage")}, commit=False)
 
     for conf in args.eval_confidence_threshold:
