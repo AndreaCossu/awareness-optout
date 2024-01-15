@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 
 
 class EarlyStopping:
@@ -73,11 +74,12 @@ def compute_dataset_confidences_predictions(mdl, method, loader, loss_fn, device
         cfd = compute_example_confidences(method, out)
         confidences.append(cfd)
 
+        for i in range(x.size(0)):
+            losses.append(loss_fn(out[i].unsqueeze(0), y[i].unsqueeze(0)))
+
         if method == 'gamblers':
             out = out[:, :-1]
         predictions.append(out.argmax(dim=-1) == y)
-        for i in range(x.size(0)):
-            losses.append(loss_fn(out[i].unsqueeze(0), y[i].unsqueeze(0)))
 
     confidences = torch.cat(confidences, dim=0)
     predictions = torch.cat(predictions, dim=0).float()
